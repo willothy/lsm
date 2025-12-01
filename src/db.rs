@@ -1,13 +1,17 @@
 use std::path::PathBuf;
 
 use crate::{
+    config::Config,
     key::{Key, SeqNo},
+    manifest::Manifest,
     memtable::{state, MemTable},
     value::Value,
     wal::{Wal, WalRecord},
 };
 
 pub struct Database {
+    config: Config,
+
     /// The active MemTable
     table: MemTable<state::Active>,
     /// Frozen, immutable memtables waiting to be turned into SSTables.
@@ -16,20 +20,35 @@ pub struct Database {
     pub wal: Wal,
 
     seqno: SeqNo,
+
+    manifest: Manifest,
 }
 
 impl Database {
-    pub fn new(wal_path: PathBuf) -> Self {
-        let wal = Wal::new(wal_path);
+    pub fn new(data_dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+        std::fs::create_dir_all(data_dir.join("sstables"))
+            .expect("Failed to create sstables directory");
+        std::fs::create_dir_all(data_dir.join("manifests"))
+            .expect("Failed to create manifests directory");
+
+        let mut wal = Wal::new(data_dir.join("wal.log"));
 
         let replay = wal.replay();
 
         let mut table = MemTable::new();
         let mut imm_tables = Vec::new();
 
-        let mut max_seqno = SeqNo::from(0u64);
+        // TODO: CURRENT should point to the latest manifest file, not be a manifest itself.
+        let manifest = Manifest::load_from_path(&data_dir.join("manifests/CURRENT"));
+
+        let mut max_seqno = manifest.last_committed_sequence_number;
 
         for record in replay {
+            if record.key().seqno() < manifest.last_committed_sequence_number {
+                continue;
+            }
+
             match record {
                 WalRecord::Put { key, val } => {
                     max_seqno = max_seqno.max(key.seqno());
@@ -48,11 +67,16 @@ impl Database {
             }
         }
 
+        // TODO: truncate WAL to remove processed entries (seqno <= last_committed_sequence_number)
+
         Self {
+            config: Config { data_dir },
+
             table,
             imm_tables,
             wal,
-            seqno: max_seqno + 1,
+            seqno: max_seqno.max(manifest.last_committed_sequence_number) + 1,
+            manifest,
         }
     }
 

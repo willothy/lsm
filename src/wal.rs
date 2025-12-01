@@ -1,5 +1,5 @@
 use std::{
-    io::{Seek, Write},
+    io::{BufWriter, Seek, Write},
     path::PathBuf,
 };
 
@@ -13,6 +13,15 @@ const WAL_MAX_SIZE: u64 = 1024 * 64 /* 64KB */;
 pub enum WalRecord {
     Put { key: Key, val: Bytes },
     Delete { key: Key },
+}
+
+impl WalRecord {
+    pub fn key(&self) -> &Key {
+        match self {
+            WalRecord::Put { key, .. } => key,
+            WalRecord::Delete { key } => key,
+        }
+    }
 }
 
 pub struct Wal {
@@ -32,11 +41,6 @@ impl Drop for Wal {
 }
 
 impl Wal {
-    const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard()
-        .with_little_endian()
-        .with_no_limit()
-        .with_variable_int_encoding();
-
     pub fn new(path: PathBuf) -> Self {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -56,7 +60,7 @@ impl Wal {
         self.size > WAL_MAX_SIZE
     }
 
-    fn read_stats(file: &std::fs::File) -> (u64, usize) {
+    fn read_stats(mut file: &std::fs::File) -> (u64, usize) {
         let mut reader = std::io::BufReader::new(file);
 
         reader
@@ -66,36 +70,27 @@ impl Wal {
         let mut len = 0;
 
         loop {
-            match bincode::serde::decode_from_reader::<WalRecord, _, _>(
-                &mut reader,
-                Self::BINCODE_CONFIG,
-            ) {
+            match crate::log::read_framed::<_, WalRecord>(&mut reader) {
                 Ok(_) => {
                     len += 1;
                 }
                 Err(e) => match e {
-                    bincode::error::DecodeError::UnexpectedEnd { .. } => break,
-                    bincode::error::DecodeError::Io { inner, .. }
-                        if matches!(inner.kind(), std::io::ErrorKind::UnexpectedEof) =>
-                    {
-                        break
+                    postcard::Error::DeserializeUnexpectedEnd => {
+                        break;
                     }
-                    _ => panic!("Invalid WAL record"),
+                    e => panic!("{e}"),
                 },
-            }
+            };
         }
 
-        let offset = reader
-            .stream_position()
-            .expect("failed to read stream position");
+        let offset = file.stream_position().expect("Failed to get WAL size");
 
         (offset, len)
     }
 
     pub fn append(&mut self, record: WalRecord) {
-        let written =
-            bincode::serde::encode_into_std_write(&record, &mut self.file, Self::BINCODE_CONFIG)
-                .expect("Failed to append to WAL");
+        let written = crate::log::write_framed(BufWriter::new(&mut self.file), &record)
+            .expect("Failed to serialize WAL record");
 
         self.size += written as u64;
         self.len += 1;
@@ -107,33 +102,15 @@ impl Wal {
         self.len
     }
 
-    pub fn replay(&self) -> Vec<WalRecord> {
-        let mut res = Vec::new();
+    pub fn replay(&mut self) -> Vec<WalRecord> {
         let mut reader = std::io::BufReader::new(&self.file);
 
         reader
             .seek(std::io::SeekFrom::Start(0))
             .expect("seek to start");
 
-        loop {
-            let record = match bincode::serde::decode_from_reader(&mut reader, Self::BINCODE_CONFIG)
-            {
-                Ok(r) => r,
-                Err(e) => match e {
-                    bincode::error::DecodeError::UnexpectedEnd { .. } => break,
-                    bincode::error::DecodeError::Io { inner, .. }
-                        if matches!(inner.kind(), std::io::ErrorKind::UnexpectedEof) =>
-                    {
-                        break
-                    }
-                    _ => panic!("Invalid WAL record"),
-                },
-            };
-
-            res.push(record);
-        }
-
-        res
+        crate::log::read_all_framed::<_, WalRecord>(&mut reader)
+            .expect("Failed to read WAL records")
     }
 
     pub fn flush(&mut self) {
