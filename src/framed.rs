@@ -1,15 +1,19 @@
 //! This modle implements a generic on-disk log structure with framing around postcard.
 
+use std::io::Write;
+
 pub fn write_framed<W, T>(mut writer: W, data: &T) -> postcard::Result<usize>
 where
-    W: std::io::Write,
+    W: Write,
     T: serde::Serialize,
 {
     let bytes = postcard::to_stdvec(&data)?;
 
     let len: u32 = bytes.len().try_into().expect("Length exceeds u32::MAX");
 
-    postcard::to_io(&len, &mut writer)?;
+    writer
+        .write_all(&len.to_le_bytes())
+        .expect("Failed to write framed length");
     writer
         .write_all(&bytes)
         .expect("Failed to write framed data");
@@ -23,11 +27,23 @@ where
     T: serde::de::DeserializeOwned,
 {
     let mut len_buf = [0u8; 4];
-    let len: u32 = postcard::from_io((&mut reader, &mut len_buf))?.0;
+    reader
+        .read_exact(&mut len_buf)
+        .map_err(|_| postcard::Error::DeserializeUnexpectedEnd)?;
+
+    let len = u32::from_le_bytes(len_buf);
+
+    if len == 0 {
+        return Err(postcard::Error::DeserializeUnexpectedEnd);
+    }
 
     let mut buf = vec![0u8; len as usize];
 
-    postcard::from_io((&mut reader, &mut buf)).map(|(data, _)| data)
+    reader
+        .read_exact(&mut buf)
+        .map_err(|_| postcard::Error::DeserializeUnexpectedEnd)?;
+
+    postcard::from_bytes(&buf)
 }
 
 pub fn read_all_framed<R, T>(mut reader: R) -> postcard::Result<Vec<T>>

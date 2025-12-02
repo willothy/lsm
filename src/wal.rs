@@ -1,5 +1,5 @@
 use std::{
-    io::{BufWriter, Seek, Write},
+    io::{Seek, Write},
     path::PathBuf,
 };
 
@@ -70,7 +70,7 @@ impl Wal {
         let mut len = 0;
 
         loop {
-            match crate::log::read_framed::<_, WalRecord>(&mut reader) {
+            match crate::framed::read_framed::<_, WalRecord>(&mut reader) {
                 Ok(_) => {
                     len += 1;
                 }
@@ -89,7 +89,7 @@ impl Wal {
     }
 
     pub fn append(&mut self, record: WalRecord) {
-        let written = crate::log::write_framed(BufWriter::new(&mut self.file), &record)
+        let written = crate::framed::write_framed(&mut self.file, &record)
             .expect("Failed to serialize WAL record");
 
         self.size += written as u64;
@@ -109,7 +109,7 @@ impl Wal {
             .seek(std::io::SeekFrom::Start(0))
             .expect("seek to start");
 
-        crate::log::read_all_framed::<_, WalRecord>(&mut reader)
+        crate::framed::read_all_framed::<_, WalRecord>(&mut reader)
             .expect("Failed to read WAL records")
     }
 

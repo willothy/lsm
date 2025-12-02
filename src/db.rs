@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use crate::{
     config::Config,
     key::{Key, SeqNo},
-    manifest::Manifest,
     memtable::{state, MemTable},
+    sstable::manager::SSTableManager,
     value::Value,
     wal::{Wal, WalRecord},
 };
@@ -21,16 +21,17 @@ pub struct Database {
 
     seqno: SeqNo,
 
-    manifest: Manifest,
+    sstables: SSTableManager,
 }
 
 impl Database {
     pub fn new(data_dir: PathBuf) -> Self {
+        let manifests_dir = data_dir.join("manifests");
+        let sstables_dir = data_dir.join("sstables");
+
         std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
-        std::fs::create_dir_all(data_dir.join("sstables"))
-            .expect("Failed to create sstables directory");
-        std::fs::create_dir_all(data_dir.join("manifests"))
-            .expect("Failed to create manifests directory");
+        std::fs::create_dir_all(&sstables_dir).expect("Failed to create sstables directory");
+        std::fs::create_dir_all(&manifests_dir).expect("Failed to create manifests directory");
 
         let mut wal = Wal::new(data_dir.join("wal.log"));
 
@@ -40,12 +41,12 @@ impl Database {
         let mut imm_tables = Vec::new();
 
         // TODO: CURRENT should point to the latest manifest file, not be a manifest itself.
-        let manifest = Manifest::load_from_path(&data_dir.join("manifests/CURRENT"));
+        let manager = SSTableManager::open(&data_dir.join("manifests"));
 
-        let mut max_seqno = manifest.last_committed_sequence_number;
+        let mut max_seqno = manager.last_committed_sequence_number();
 
         for record in replay {
-            if record.key().seqno() < manifest.last_committed_sequence_number {
+            if record.key().seqno() < manager.last_committed_sequence_number() {
                 continue;
             }
 
@@ -75,8 +76,8 @@ impl Database {
             table,
             imm_tables,
             wal,
-            seqno: max_seqno.max(manifest.last_committed_sequence_number) + 1,
-            manifest,
+            seqno: max_seqno.max(manager.last_committed_sequence_number()) + 1,
+            sstables: manager,
         }
     }
 
