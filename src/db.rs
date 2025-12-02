@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, rc::Rc};
 
 use anyhow::Context;
 
@@ -12,7 +12,7 @@ use crate::{
 };
 
 pub struct Database {
-    config: Config,
+    config: Rc<Config>,
 
     /// The active MemTable
     table: MemTable<state::Active>,
@@ -27,15 +27,17 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn open(data_dir: PathBuf) -> anyhow::Result<Self> {
-        let manifests_dir = data_dir.join("manifests");
-        let sstables_dir = data_dir.join("sstables");
+    pub fn open(config: Config) -> anyhow::Result<Self> {
+        let config = Rc::new(config);
 
-        std::fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
+        let manifests_dir = config.data_dir.join("manifests");
+        let sstables_dir = config.data_dir.join("sstables");
+
+        std::fs::create_dir_all(&config.data_dir).context("Failed to create data directory")?;
         std::fs::create_dir_all(&sstables_dir).context("Failed to create sstables directory")?;
         std::fs::create_dir_all(&manifests_dir).context("Failed to create manifests directory")?;
 
-        let mut wal = Wal::open(data_dir.join("wal.log"))?;
+        let mut wal = Wal::open(config.data_dir.join("wal.log"))?;
 
         let replay = wal.replay()?;
 
@@ -43,7 +45,7 @@ impl Database {
         let mut imm_tables = Vec::new();
 
         // TODO: CURRENT should point to the latest manifest file, not be a manifest itself.
-        let manager = SSTableManager::open(&data_dir.join("manifests"))?;
+        let manager = SSTableManager::open(Rc::clone(&config))?;
 
         let mut max_seqno = manager.last_committed_sequence_number();
 
@@ -73,7 +75,7 @@ impl Database {
         // TODO: truncate WAL to remove processed entries (seqno <= last_committed_sequence_number)
 
         Ok(Self {
-            config: Config { data_dir },
+            config,
 
             table,
             imm_tables,

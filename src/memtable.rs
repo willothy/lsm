@@ -43,7 +43,11 @@ impl<S: MemTableState> MemTable<S> {
     }
 }
 
-// impl MemTable<Frozen> {}
+impl MemTable<state::Frozen> {
+    pub fn data(&self) -> &BTreeMap<Key, Value> {
+        &self.data
+    }
+}
 
 impl MemTable<state::Active> {
     pub fn new() -> Self {

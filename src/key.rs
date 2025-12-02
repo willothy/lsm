@@ -1,3 +1,5 @@
+use bytes::{Buf, BufMut};
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -70,6 +72,38 @@ impl Key {
 
     pub fn seqno(&self) -> SeqNo {
         self.1
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        4 + self.0.len() + 8
+    }
+
+    pub fn encode_to_bytes(&self) -> bytes::Bytes {
+        let mut buf = bytes::BytesMut::with_capacity(self.encoded_len());
+        self.encode_into(&mut buf);
+        buf.freeze()
+    }
+
+    /// Encodes the Key into the provided buffer.
+    pub fn encode_into(&self, buf: &mut bytes::BytesMut) {
+        let key_len = self.0.len() as u32;
+        buf.put_u32_le(key_len);
+        buf.put_slice(&self.0);
+        buf.put_u64_le(self.1.get());
+    }
+
+    pub fn decode_from(buf: &mut bytes::Bytes) -> anyhow::Result<Self> {
+        let key_len = buf.try_get_u32_le()?;
+
+        if buf.remaining() < key_len as usize + 8 {
+            anyhow::bail!("Buffer too small to decode Key");
+        }
+
+        let user_key = buf.copy_to_bytes(key_len as usize);
+
+        let seqno = buf.try_get_u64_le()?;
+
+        Ok(Key(user_key, SeqNo(seqno)))
     }
 }
 

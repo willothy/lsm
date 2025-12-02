@@ -1,4 +1,5 @@
 use clap::Parser;
+use mintdb::config::Config;
 
 #[derive(Debug, Clone, clap::Parser)]
 pub struct Cli {
@@ -30,7 +31,9 @@ pub enum CliCommand {
 fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
-    let mut db = mintdb::Database::open("example_wal".into())?;
+    let mut db = mintdb::Database::open(Config {
+        data_dir: "example_wal".into(),
+    })?;
 
     match args.command {
         CliCommand::Get { key } => {
