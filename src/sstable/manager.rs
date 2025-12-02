@@ -36,6 +36,8 @@ impl std::fmt::Display for FileNo {
     }
 }
 
+pub const SSTABLE_MAGIC: u32 = 0xDEAD_BEEF;
+
 /// L0 (base) SSTable file size (64MB).
 pub const BASE_LEVEL_SIZE: usize = 1024 * 1024 * 64;
 /// SSTable size ratio. Each level's file size is determined by [`BASE_LEVEL_SIZE`] * [`SIZE_RATIO`]^2.
@@ -279,26 +281,15 @@ impl SSTableManager {
 
         file.write_all(&index_buf)?;
 
+        let index_size = index_buf.len();
+
         let footer = SSTableFooter {
             index_offset: index_start,
-            index_size: index_buf.len() as u64,
+            index_size: index_size as u64,
             _reserved1: 0,
             _reserved2: 0,
-            magic: 0xDEAD_BEEF,
+            magic: SSTABLE_MAGIC,
         };
-
-        self.append_record(ManifestRecord::CreateFile {
-            level: Level(0),
-            file_meta: FileMeta {
-                file_number: file_no.0,
-                file_size: sstable_size
-                    + index_buf.len() as u64
-                    + std::mem::size_of::<SSTableFooter>() as u64,
-                smallest_key: first_key.encode_to_bytes(),
-                largest_key: last_key.encode_to_bytes(),
-            },
-        })?;
-        self.sync()?;
 
         index_buf.clear();
 
@@ -308,6 +299,19 @@ impl SSTableManager {
 
         file.flush()?;
         file.sync_all()?;
+
+        self.append_record(ManifestRecord::CreateFile {
+            level: Level(0),
+            file_meta: FileMeta {
+                file_number: file_no.0,
+                file_size: sstable_size
+                    + index_size as u64
+                    + std::mem::size_of::<SSTableFooter>() as u64,
+                smallest_key: first_key.encode_to_bytes(),
+                largest_key: last_key.encode_to_bytes(),
+            },
+        })?;
+        self.sync()?;
 
         Ok(())
     }
@@ -364,37 +368,37 @@ impl SSTableManager {
                 sstable_size += current_block.len() as u64;
 
                 current_block.clear();
-            }
 
-            if sstable_size
-                + index_block_size(&block_meta) as u64
-                + std::mem::size_of::<SSTableFooter>() as u64
-                >= (BASE_LEVEL_SIZE as u64)
-            {
-                self.finalize_sstable(
-                    &mut file,
-                    file_no,
-                    sstable_size,
-                    first_key.as_ref().expect("smallest key"),
-                    last_key.as_ref().expect("largest key"),
-                    &block_meta,
-                )?;
+                if sstable_size
+                    + index_block_size(&block_meta) as u64
+                    + std::mem::size_of::<SSTableFooter>() as u64
+                    >= (BASE_LEVEL_SIZE as u64)
+                {
+                    self.finalize_sstable(
+                        &mut file,
+                        file_no,
+                        sstable_size,
+                        first_key.as_ref().expect("smallest key"),
+                        last_key.as_ref().expect("largest key"),
+                        &block_meta,
+                    )?;
 
-                block_meta.clear();
-                sstable_size = 0;
-                first_key = None;
-                last_key = None;
+                    block_meta.clear();
+                    sstable_size = 0;
+                    first_key = None;
+                    last_key = None;
 
-                // Don't allocate a new file if this is the last entry
-                if idx + 1 < data.len() {
-                    file_no = self.alloc_file_number()?;
-                    let new_file_name = format_file_name(file_no, SSTABLE_FILE_EXT);
-                    file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .read(true)
-                        .open(&self.config.data_dir.join("sstables").join(new_file_name))
-                        .context("Failed to create new SSTable file")?;
+                    // Don't allocate a new file if this is the last entry
+                    if idx + 1 < data.len() {
+                        file_no = self.alloc_file_number()?;
+                        let new_file_name = format_file_name(file_no, SSTABLE_FILE_EXT);
+                        file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .read(true)
+                            .open(&self.config.data_dir.join("sstables").join(new_file_name))
+                            .context("Failed to create new SSTable file")?;
+                    }
                 }
             }
         }
@@ -411,6 +415,8 @@ impl SSTableManager {
             });
 
             file.write_all(&current_block)?;
+
+            sstable_size += current_block.len() as u64;
 
             self.finalize_sstable(
                 &mut file,
