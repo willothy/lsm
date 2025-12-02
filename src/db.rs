@@ -112,9 +112,12 @@ impl Database {
         let val = val.into();
         let key = Key::new(key, self.seqno.next());
 
-        self.table.put(key.clone(), val.clone());
+        self.wal.append(WalRecord::Put {
+            key: key.clone(),
+            val: val.clone(),
+        });
 
-        self.wal.append(WalRecord::Put { key, val });
+        self.table.put(key, val);
 
         self.maybe_rotate_memtable();
     }
@@ -123,9 +126,9 @@ impl Database {
         let key = key.into();
         let key = Key::new(key, self.seqno.next());
 
-        self.table.delete(key.clone());
+        self.wal.append(WalRecord::Delete { key: key.clone() });
 
-        self.wal.append(WalRecord::Delete { key });
+        self.table.delete(key);
 
         self.maybe_rotate_memtable();
     }
