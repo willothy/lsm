@@ -27,10 +27,10 @@ pub enum CliCommand {
     },
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
-    let mut db = mintdb::Database::new("example_wal".into());
+    let mut db = mintdb::Database::open("example_wal".into())?;
 
     match args.command {
         CliCommand::Get { key } => {
@@ -48,13 +48,15 @@ fn main() {
                         panic!("Value must be provided either as an argument or via stdin");
                     }
                 }),
-            );
+            )?;
         }
         CliCommand::Delete { key } => {
-            db.delete(key);
+            db.delete(key)?;
         }
     }
 
-    let r = db.debug_replay_wal();
+    let r = db.debug_replay_wal()?;
     println!("{:?} ({})", r, r.len());
+
+    Ok(())
 }

@@ -3,6 +3,7 @@ use std::{
     path::PathBuf,
 };
 
+use anyhow::Context;
 use bytes::Bytes;
 
 use crate::key::Key;
@@ -34,38 +35,42 @@ pub struct Wal {
 
 impl Drop for Wal {
     fn drop(&mut self) {
-        self.flush();
+        if let Err(e) = self.flush() {
+            eprintln!("Failed to flush WAL on drop: {:?}", e);
+        }
 
-        self.file.unlock().expect("Failed to unlock WAL file");
+        if let Err(e) = self.file.unlock() {
+            eprintln!("Failed to unlock WAL file on drop: {:?}", e);
+        }
     }
 }
 
 impl Wal {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn open(path: PathBuf) -> anyhow::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&path)
-            .expect("Failed to open WAL file");
+            .context("Failed to open WAL file")?;
 
-        file.lock().expect("Failed to lock WAL file");
+        file.lock().context("Failed to lock WAL file")?;
 
-        let (size, len) = Self::read_stats(&file);
+        let (size, len) = Self::read_stats(&file)?;
 
-        Wal { file, len, size }
+        Ok(Wal { file, len, size })
     }
 
     pub fn should_compact(&self) -> bool {
         self.size > WAL_MAX_SIZE
     }
 
-    fn read_stats(mut file: &std::fs::File) -> (u64, usize) {
+    fn read_stats(mut file: &std::fs::File) -> anyhow::Result<(u64, usize)> {
         let mut reader = std::io::BufReader::new(file);
 
         reader
             .seek(std::io::SeekFrom::Start(0))
-            .expect("seek to start");
+            .context("seek to start")?;
 
         let mut len = 0;
 
@@ -83,47 +88,53 @@ impl Wal {
             };
         }
 
-        let offset = file.stream_position().expect("Failed to get WAL size");
+        let offset = file.stream_position().context("Failed to get WAL size")?;
 
-        (offset, len)
+        Ok((offset, len))
     }
 
-    pub fn append(&mut self, record: WalRecord) {
+    pub fn append(&mut self, record: WalRecord) -> anyhow::Result<()> {
         let written = crate::framed::write_framed(&mut self.file, &record)
-            .expect("Failed to serialize WAL record");
+            .context("Failed to serialize WAL record")?;
 
         self.size += written as u64;
         self.len += 1;
 
-        self.flush();
+        self.flush()?;
+
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
         self.len
     }
 
-    pub fn replay(&mut self) -> Vec<WalRecord> {
+    pub fn replay(&mut self) -> anyhow::Result<Vec<WalRecord>> {
         let mut reader = std::io::BufReader::new(&self.file);
 
         reader
             .seek(std::io::SeekFrom::Start(0))
-            .expect("seek to start");
+            .context("seek to start")?;
 
-        crate::framed::read_all_framed::<_, WalRecord>(&mut reader)
-            .expect("Failed to read WAL records")
+        Ok(crate::framed::read_all_framed::<_, WalRecord>(&mut reader)
+            .context("Failed to read WAL records")?)
     }
 
-    pub fn flush(&mut self) {
-        self.file.flush().expect("Failed to flush WAL");
-        self.file.sync_all().expect("Failed to sync WAL");
+    pub fn flush(&mut self) -> anyhow::Result<()> {
+        self.file.flush().context("Failed to flush WAL")?;
+        self.file.sync_all().context("Failed to sync WAL")?;
+
+        Ok(())
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self) -> anyhow::Result<()> {
         self.file
             .set_len(0)
-            .expect("Failed to truncate WAL for clear");
+            .context("Failed to truncate WAL for clear")?;
 
         self.len = 0;
         self.size = 0;
+
+        Ok(())
     }
 }

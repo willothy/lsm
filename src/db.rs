@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use anyhow::Context;
+
 use crate::{
     config::Config,
     key::{Key, SeqNo},
@@ -25,23 +27,23 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn open(data_dir: PathBuf) -> anyhow::Result<Self> {
         let manifests_dir = data_dir.join("manifests");
         let sstables_dir = data_dir.join("sstables");
 
-        std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
-        std::fs::create_dir_all(&sstables_dir).expect("Failed to create sstables directory");
-        std::fs::create_dir_all(&manifests_dir).expect("Failed to create manifests directory");
+        std::fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
+        std::fs::create_dir_all(&sstables_dir).context("Failed to create sstables directory")?;
+        std::fs::create_dir_all(&manifests_dir).context("Failed to create manifests directory")?;
 
-        let mut wal = Wal::new(data_dir.join("wal.log"));
+        let mut wal = Wal::open(data_dir.join("wal.log"))?;
 
-        let replay = wal.replay();
+        let replay = wal.replay()?;
 
         let mut table = MemTable::new();
         let mut imm_tables = Vec::new();
 
         // TODO: CURRENT should point to the latest manifest file, not be a manifest itself.
-        let manager = SSTableManager::open(&data_dir.join("manifests"));
+        let manager = SSTableManager::open(&data_dir.join("manifests"))?;
 
         let mut max_seqno = manager.last_committed_sequence_number();
 
@@ -70,7 +72,7 @@ impl Database {
 
         // TODO: truncate WAL to remove processed entries (seqno <= last_committed_sequence_number)
 
-        Self {
+        Ok(Self {
             config: Config { data_dir },
 
             table,
@@ -78,7 +80,7 @@ impl Database {
             wal,
             seqno: max_seqno.max(manager.last_committed_sequence_number()) + 1,
             sstables: manager,
-        }
+        })
     }
 
     pub fn should_freeze_memtable(&self) -> bool {
@@ -107,7 +109,11 @@ impl Database {
         None
     }
 
-    pub fn put(&mut self, key: impl Into<bytes::Bytes>, val: impl Into<bytes::Bytes>) {
+    pub fn put(
+        &mut self,
+        key: impl Into<bytes::Bytes>,
+        val: impl Into<bytes::Bytes>,
+    ) -> anyhow::Result<()> {
         let key = key.into();
         let val = val.into();
         let key = Key::new(key, self.seqno.next());
@@ -115,22 +121,26 @@ impl Database {
         self.wal.append(WalRecord::Put {
             key: key.clone(),
             val: val.clone(),
-        });
+        })?;
 
         self.table.put(key, val);
 
         self.maybe_rotate_memtable();
+
+        Ok(())
     }
 
-    pub fn delete(&mut self, key: impl Into<bytes::Bytes>) {
+    pub fn delete(&mut self, key: impl Into<bytes::Bytes>) -> anyhow::Result<()> {
         let key = key.into();
         let key = Key::new(key, self.seqno.next());
 
-        self.wal.append(WalRecord::Delete { key: key.clone() });
+        self.wal.append(WalRecord::Delete { key: key.clone() })?;
 
         self.table.delete(key);
 
         self.maybe_rotate_memtable();
+
+        Ok(())
     }
 
     fn maybe_rotate_memtable(&mut self) {
@@ -146,7 +156,7 @@ impl Database {
         }
     }
 
-    pub fn debug_replay_wal(&mut self) -> Vec<WalRecord> {
+    pub fn debug_replay_wal(&mut self) -> anyhow::Result<Vec<WalRecord>> {
         self.wal.replay()
     }
 }

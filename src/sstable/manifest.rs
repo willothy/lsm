@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use anyhow::Context;
+
 use crate::{
     key::SeqNo,
     sstable::{manager::FileNo, Level},
@@ -41,11 +43,11 @@ impl Manifest {
         (id, ManifestRecord::AllocFileNumber(id))
     }
 
-    pub fn load_from_file(file: &std::fs::File) -> Self {
+    pub fn load_from_file(file: &std::fs::File) -> anyhow::Result<Self> {
         let reader = std::io::BufReader::new(file);
 
         let logs = crate::framed::read_all_framed::<_, ManifestRecord>(reader)
-            .expect("Failed to read manifest records");
+            .context("Failed to read manifest records")?;
 
         // There is always at least level 0.
         //
@@ -101,7 +103,7 @@ impl Manifest {
             }
         }
 
-        manifest
+        Ok(manifest)
     }
 }
 

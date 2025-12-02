@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
 
+use anyhow::Context;
+
 use crate::{
     key::SeqNo,
     sstable::{
@@ -61,7 +63,7 @@ impl Drop for SSTableManager {
 }
 
 impl SSTableManager {
-    pub fn open(manifests_dir: &std::path::Path) -> Self {
+    pub fn open(manifests_dir: &std::path::Path) -> anyhow::Result<Self> {
         let current_file_path = manifests_dir.join(CURRENT_FILE_NAME);
 
         let (current_file, active_file, active_manifest) = if !current_file_path
@@ -70,7 +72,7 @@ impl SSTableManager {
         {
             let (current_file, active_file, active_manifest) = if manifests_dir
                 .read_dir()
-                .expect("Failed to read manifest dir")
+                .context("Failed to read manifest dir")?
                 .next()
                 .is_none()
             {
@@ -80,9 +82,9 @@ impl SSTableManager {
                     .write(true)
                     .read(true)
                     .open(&current_file_path)
-                    .expect("Failed to create CURRENT file");
+                    .context("Failed to create CURRENT file")?;
 
-                current_file.lock().expect("Failed to lock CURRENT file");
+                current_file.lock().context("Failed to lock CURRENT file")?;
 
                 let mut manifest = Manifest::new();
 
@@ -93,39 +95,41 @@ impl SSTableManager {
 
                 current_file
                     .set_len(0)
-                    .expect("Failed to truncate CURRENT file");
+                    .context("Failed to truncate CURRENT file")?;
                 current_file
                     .write_all(initial_manifest_name.as_bytes())
-                    .expect("Failed to write initial manifest id to CURRENT file");
+                    .context("Failed to write initial manifest id to CURRENT file")?;
 
-                current_file.flush().expect("Failed to flush CURRENT file");
+                current_file
+                    .flush()
+                    .context("Failed to flush CURRENT file")?;
                 current_file
                     .sync_all()
-                    .expect("Failed to sync CURRENT file");
+                    .context("Failed to sync CURRENT file")?;
 
                 let mut active_file = std::fs::OpenOptions::new()
                     .create(true)
                     .read(true)
                     .append(true)
                     .open(manifests_dir.join(&initial_manifest_name))
-                    .expect("Failed to create first manifest");
+                    .context("Failed to create first manifest")?;
 
                 active_file
                     .lock()
-                    .expect("Failed to lock active manifest file");
+                    .context("Failed to lock active manifest file")?;
 
                 crate::framed::write_framed(
                     &mut active_file,
                     &ManifestRecord::Snapshot(manifest.clone()),
                 )
-                .expect("Failed to write initial manifest snapshot");
+                .context("Failed to write initial manifest snapshot")?;
 
                 active_file
                     .flush()
-                    .expect("Failed to flush active manifest file");
+                    .context("Failed to flush active manifest file")?;
                 active_file
                     .sync_all()
-                    .expect("Failed to sync active manifest file");
+                    .context("Failed to sync active manifest file")?;
 
                 (current_file, active_file, manifest)
             } else {
@@ -139,62 +143,66 @@ impl SSTableManager {
                 .read(true)
                 .write(true)
                 .open(&current_file_path)
-                .expect("Failed to open CURRENT file");
+                .context("Failed to open CURRENT file")?;
 
-            current_file.lock().expect("Failed to lock CURRENT file");
+            current_file.lock().context("Failed to lock CURRENT file")?;
 
             let mut current_manfiest_name = String::new();
             current_file
                 .read_to_string(&mut current_manfiest_name)
-                .expect("Failed to read current manifest name from CURRENT file");
+                .context("Failed to read current manifest name from CURRENT file")?;
 
             let current_manifest_file = std::fs::OpenOptions::new()
                 .create(false)
                 .read(true)
                 .append(true)
                 .open(manifests_dir.join(&current_manfiest_name))
-                .expect("Failed to open current manifest file");
+                .context("Failed to open current manifest file")?;
 
             current_manifest_file
                 .lock()
-                .expect("Failed to lock current manifest file");
+                .context("Failed to lock current manifest file")?;
 
-            let manifest = Manifest::load_from_file(&current_manifest_file);
+            let manifest = Manifest::load_from_file(&current_manifest_file)?;
 
             (current_file, current_manifest_file, manifest)
         };
 
-        SSTableManager {
+        Ok(SSTableManager {
             current: current_file,
 
             active_file,
             active_manifest,
-        }
+        })
     }
 
-    fn append_record(&mut self, record: ManifestRecord) {
+    fn append_record(&mut self, record: ManifestRecord) -> anyhow::Result<()> {
         crate::framed::write_framed(&mut self.active_file, &record)
-            .expect("Failed to append record");
+            .context("Failed to append record")?;
+
+        Ok(())
     }
 
-    fn sync(&mut self) {
+    fn sync(&mut self) -> anyhow::Result<()> {
         self.active_file
             .flush()
-            .expect("Failed to flush active manifest file");
+            .context("Failed to flush active manifest file")?;
 
         self.active_file
             .sync_all()
-            .expect("Failed to fsync active manifest file");
+            .context("Failed to fsync active manifest file")?;
+
+        Ok(())
     }
 
-    pub fn alloc_file_number(&mut self) -> FileNo {
+    pub fn alloc_file_number(&mut self) -> anyhow::Result<FileNo> {
         let (fileno, record) = self.active_manifest.alloc_file_number();
 
-        self.append_record(record);
+        self.append_record(record)?;
 
-        self.sync();
+        self.sync()?;
 
-        fileno
+        Ok(fileno)
     }
 
     pub fn last_committed_sequence_number(&self) -> SeqNo {

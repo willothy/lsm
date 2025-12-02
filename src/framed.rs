@@ -2,21 +2,23 @@
 
 use std::io::Write;
 
-pub fn write_framed<W, T>(mut writer: W, data: &T) -> postcard::Result<usize>
+use anyhow::Context;
+
+pub fn write_framed<W, T>(mut writer: W, data: &T) -> anyhow::Result<usize>
 where
     W: Write,
     T: serde::Serialize,
 {
     let bytes = postcard::to_stdvec(&data)?;
 
-    let len: u32 = bytes.len().try_into().expect("Length exceeds u32::MAX");
+    let len: u32 = bytes.len().try_into().context("Length exceeds u32::MAX")?;
 
     writer
         .write_all(&len.to_le_bytes())
-        .expect("Failed to write framed length");
+        .context("Failed to write framed length")?;
     writer
         .write_all(&bytes)
-        .expect("Failed to write framed data");
+        .context("Failed to write framed data")?;
 
     Ok(bytes.len() + 4)
 }
