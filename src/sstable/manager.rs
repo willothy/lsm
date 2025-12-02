@@ -242,10 +242,6 @@ impl SSTableManager {
 
         file.write_all(&index_buf)?;
 
-        file.seek(std::io::SeekFrom::Start(
-            (BASE_LEVEL_SIZE - std::mem::size_of::<SSTableFooter>()) as u64,
-        ))?;
-
         let footer = SSTableFooter {
             index_offset: index_start,
             index_size: index_buf.len() as u64,
@@ -272,6 +268,7 @@ impl SSTableManager {
                 largest_key: last_key.encode_to_bytes(),
             },
         })?;
+        self.sync()?;
 
         Ok(())
     }
@@ -280,6 +277,10 @@ impl SSTableManager {
         &mut self,
         memtable: &crate::memtable::MemTable<Frozen>,
     ) -> anyhow::Result<()> {
+        if memtable.data().is_empty() {
+            return Ok(());
+        }
+
         let mut file_no = self.alloc_file_number()?;
         let mut file = {
             let file_name = format_file_name(file_no, SSTABLE_FILE_EXT);
@@ -303,7 +304,9 @@ impl SSTableManager {
         let mut first_key = None;
         let mut last_key = None;
 
-        for (key, val) in memtable.data() {
+        let data = memtable.data();
+
+        for (idx, (key, val)) in data.iter().enumerate() {
             first_key = Some(first_key.unwrap_or_else(|| key.clone()));
 
             entry_buf.clear();
@@ -312,10 +315,6 @@ impl SSTableManager {
             val.encode_into(&mut entry_buf);
 
             if current_block.len() + entry_buf.len() >= BLOCK_SIZE {
-                file.write_all(&current_block)?;
-
-                current_block.clear();
-
                 block_meta.push(BlockMeta {
                     last_key: last_key.clone().expect(
                         "There should be at least one key in the block if we're writing it",
@@ -323,6 +322,10 @@ impl SSTableManager {
                     offset: file.stream_position()?,
                     size: current_block.len() as u32,
                 });
+
+                file.write_all(&current_block)?;
+
+                current_block.clear();
 
                 sstable_size += BLOCK_SIZE as u64;
             }
@@ -346,14 +349,17 @@ impl SSTableManager {
                 sstable_size = 0;
                 first_key = None;
 
-                file_no = self.alloc_file_number()?;
-                let new_file_name = format_file_name(file_no, SSTABLE_FILE_EXT);
-                file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .read(true)
-                    .open(&self.config.data_dir.join("sstables").join(new_file_name))
-                    .context("Failed to create new SSTable file")?;
+                // Don't allocate a new file if this is the last entry
+                if idx + 1 < data.len() {
+                    file_no = self.alloc_file_number()?;
+                    let new_file_name = format_file_name(file_no, SSTABLE_FILE_EXT);
+                    file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .read(true)
+                        .open(&self.config.data_dir.join("sstables").join(new_file_name))
+                        .context("Failed to create new SSTable file")?;
+                }
             }
 
             current_block.put_slice(&entry_buf);
@@ -361,13 +367,27 @@ impl SSTableManager {
             last_key = Some(key.clone());
         }
 
-        self.finalize_sstable(
-            &mut file,
-            file_no,
-            first_key.as_ref().expect("smallest key"),
-            last_key.as_ref().expect("largest key"),
-            &block_meta,
-        )?;
+        // If first_key is None, we finalized the SSTable on the last entry and skipped
+        // creating a second one.
+        if let Some(smallest_key) = &first_key {
+            block_meta.push(BlockMeta {
+                last_key: last_key
+                    .clone()
+                    .expect("There should be at least one key in the block if we're writing it"),
+                offset: file.stream_position()?,
+                size: current_block.len() as u32,
+            });
+
+            file.write_all(&current_block)?;
+
+            self.finalize_sstable(
+                &mut file,
+                file_no,
+                smallest_key,
+                last_key.as_ref().expect("largest key"),
+                &block_meta,
+            )?;
+        }
 
         Ok(())
     }
