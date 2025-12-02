@@ -96,7 +96,7 @@ impl Manifest {
                     manifest.last_committed_sequence_number = seq_no;
                 }
                 ManifestRecord::AllocFileNumber(file_no) => {
-                    manifest.next_file_number = file_no.max(manifest.next_file_number);
+                    manifest.next_file_number = manifest.next_file_number.max(file_no + 1);
                 }
             }
         }
