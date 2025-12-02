@@ -1,15 +1,18 @@
 use std::{
     io::{Read, Seek, Write},
-    rc::Rc,
+    sync::Arc,
 };
 
 use anyhow::Context;
 use bytes::BufMut;
+use parking_lot::{Mutex, RwLock};
+use seize::Guard;
 
 use crate::{
     config::Config,
+    db::FrozenTables,
     key::{Key, SeqNo},
-    memtable::state::Frozen,
+    memtable::{state::Frozen, MemTable},
     sstable::{
         manifest::{FileMeta, LevelMeta, Manifest, ManifestRecord},
         sstable::{index_block_size, BlockMeta, SSTableFooter, BLOCK_SIZE},
@@ -57,24 +60,25 @@ pub fn format_file_name(id: FileNo, ext: &str) -> String {
 
 #[derive(Debug)]
 pub struct SSTableManager {
-    config: Rc<crate::config::Config>,
+    config: Arc<crate::config::Config>,
 
     /// Locked [`CURRENT_FILE_NAME`] file acts as a pointer to the active [`Manifest`].
-    current: std::fs::File,
+    current: Mutex<std::fs::File>,
 
-    active_file: std::fs::File,
-    active_manifest: Manifest,
+    active_file: Mutex<std::fs::File>,
+
+    active_manifest: RwLock<Manifest>,
 }
 
 impl Drop for SSTableManager {
     fn drop(&mut self) {
-        self.current.unlock().ok();
-        self.active_file.unlock().ok();
+        self.current.lock().unlock().ok();
+        self.active_file.lock().unlock().ok();
     }
 }
 
 impl SSTableManager {
-    pub fn open(config: Rc<Config>) -> anyhow::Result<Self> {
+    pub fn open(config: Arc<Config>) -> anyhow::Result<Self> {
         let manifests_dir = config.data_dir.join("manifests");
         let current_file_path = manifests_dir.join(CURRENT_FILE_NAME);
 
@@ -183,23 +187,24 @@ impl SSTableManager {
         Ok(SSTableManager {
             config,
 
-            current: current_file,
+            current: Mutex::new(current_file),
 
-            active_file,
-            active_manifest,
+            active_file: Mutex::new(active_file),
+            active_manifest: RwLock::new(active_manifest),
         })
     }
 
-    fn append_record(&mut self, record: ManifestRecord) -> anyhow::Result<()> {
-        crate::framed::write_framed(&mut self.active_file, &record)
+    fn append_record(&self, record: ManifestRecord) -> anyhow::Result<()> {
+        crate::framed::write_framed(&mut *self.active_file.lock(), &record)
             .context("Failed to append record")?;
 
         match record {
             ManifestRecord::Snapshot(manifest) => {
-                self.active_manifest = manifest;
+                *self.active_manifest.write() = manifest;
             }
             ManifestRecord::CreateFile { level, file_meta } => {
                 self.active_manifest
+                    .write()
                     .levels
                     .entry(level)
                     .or_insert_with(|| LevelMeta {
@@ -211,6 +216,7 @@ impl SSTableManager {
             }
             ManifestRecord::DeleteFile { level, file_number } => {
                 self.active_manifest
+                    .write()
                     .levels
                     .entry(level)
                     .or_insert_with(|| LevelMeta {
@@ -221,32 +227,36 @@ impl SSTableManager {
                     .remove(&FileNo(file_number));
             }
             ManifestRecord::SetLastSeqNo(seq_no) => {
-                self.active_manifest.last_committed_sequence_number =
-                    seq_no.max(self.active_manifest.last_committed_sequence_number);
+                let mut manifest = self.active_manifest.write();
+                manifest.last_committed_sequence_number =
+                    seq_no.max(manifest.last_committed_sequence_number);
             }
             ManifestRecord::AllocFileNumber(file_no) => {
-                self.active_manifest.next_file_number =
-                    self.active_manifest.next_file_number.max(file_no + 1);
+                let mut manifest = self.active_manifest.write();
+
+                manifest.next_file_number = manifest.next_file_number.max(file_no + 1);
             }
         }
 
         Ok(())
     }
 
-    fn sync(&mut self) -> anyhow::Result<()> {
+    fn sync(&self) -> anyhow::Result<()> {
         self.active_file
+            .lock()
             .flush()
             .context("Failed to flush active manifest file")?;
 
         self.active_file
+            .lock()
             .sync_all()
             .context("Failed to fsync active manifest file")?;
 
         Ok(())
     }
 
-    pub fn alloc_file_number(&mut self) -> anyhow::Result<FileNo> {
-        let (fileno, record) = self.active_manifest.alloc_file_number();
+    pub fn alloc_file_number(&self) -> anyhow::Result<FileNo> {
+        let (fileno, record) = self.active_manifest.write().alloc_file_number();
 
         self.append_record(record)?;
 
@@ -256,11 +266,11 @@ impl SSTableManager {
     }
 
     pub fn last_committed_sequence_number(&self) -> SeqNo {
-        self.active_manifest.last_committed_sequence_number
+        self.active_manifest.read().last_committed_sequence_number
     }
 
     fn finalize_sstable(
-        &mut self,
+        &self,
         file: &mut std::fs::File,
         file_no: FileNo,
         sstable_size: u64,
@@ -316,14 +326,11 @@ impl SSTableManager {
         Ok(())
     }
 
-    pub fn flush_memtable(
-        &mut self,
+    fn flush_memtable_internal(
+        &self,
         memtable: &crate::memtable::MemTable<Frozen>,
+        frozen: Arc<FrozenTables>,
     ) -> anyhow::Result<()> {
-        if memtable.data().is_empty() {
-            return Ok(());
-        }
-
         let mut file_no = self.alloc_file_number()?;
         let mut file = {
             let file_name = format_file_name(file_no, SSTABLE_FILE_EXT);
@@ -428,6 +435,48 @@ impl SSTableManager {
             )?;
         }
 
+        frozen.mark_flushed();
+
         Ok(())
+    }
+
+    pub fn flush_memtable(
+        &self,
+        memtable: &crate::memtable::MemTable<Frozen>,
+        frozen: Arc<FrozenTables>,
+    ) -> anyhow::Result<()> {
+        if memtable.data().is_empty() {
+            return Ok(());
+        }
+
+        self.flush_memtable_internal(&memtable, frozen)?;
+
+        Ok(())
+    }
+
+    pub fn max_level(&self) -> Level {
+        let manifest = self.active_manifest.read();
+
+        manifest
+            .levels
+            .keys()
+            .max()
+            .cloned()
+            .unwrap_or_else(|| Level(0))
+    }
+
+    pub fn iter_level(&self, level: Level) -> anyhow::Result<impl Iterator<Item = FileMeta> + '_> {
+        let manifest = self.active_manifest.read();
+
+        let level_meta = manifest
+            .levels
+            .get(&level)
+            .cloned()
+            .unwrap_or_else(|| LevelMeta {
+                level,
+                files: Default::default(),
+            });
+
+        Ok(level_meta.files.values().cloned())
     }
 }

@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use crate::{key::Key, value::Value};
 
 pub mod state {
+    #[derive(Debug, Clone)]
     pub struct Frozen;
+    #[derive(Debug, Clone)]
     pub struct Active;
 
     pub trait MemTableState: sealed::Sealed {}
@@ -18,6 +20,7 @@ pub mod state {
 
 use state::MemTableState;
 
+#[derive(Debug, Clone)]
 pub struct MemTable<State: MemTableState> {
     data: BTreeMap<Key, Value>,
     size: usize,
