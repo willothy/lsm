@@ -40,7 +40,7 @@ pub const SSTABLE_MAGIC: u32 = 0xDEAD_BEEF;
 
 /// L0 (base) SSTable file size (64MB).
 pub const BASE_LEVEL_SIZE: usize = 1024 * 1024 * 64;
-/// SSTable size ratio. Each level's file size is determined by [`BASE_LEVEL_SIZE`] * [`SIZE_RATIO`]^2.
+/// SSTable size ratio. Each level's file size is determined by [`BASE_LEVEL_SIZE`] * [`SIZE_RATIO`]^level.
 pub const SIZE_RATIO: usize = 10;
 
 pub fn calculate_sstable_size(level: &Level) -> usize {
