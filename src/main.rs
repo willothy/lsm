@@ -55,6 +55,6 @@ fn main() {
         }
     }
 
-    let r = db.wal.replay();
+    let r = db.debug_replay_wal();
     println!("{:?} ({})", r, r.len());
 }

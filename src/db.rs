@@ -17,7 +17,7 @@ pub struct Database {
     /// Frozen, immutable memtables waiting to be turned into SSTables.
     imm_tables: Vec<MemTable<state::Frozen>>,
 
-    pub wal: Wal,
+    wal: Wal,
 
     seqno: SeqNo,
 
@@ -144,5 +144,9 @@ impl Database {
             // For now, we'll just never clear the WAL because we don't have SSTables.
             // self.wal.clear();
         }
+    }
+
+    pub fn debug_replay_wal(&mut self) -> Vec<WalRecord> {
+        self.wal.replay()
     }
 }
