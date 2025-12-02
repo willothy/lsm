@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::{key::Key, value::Value, wal::WalRecord};
+use crate::{key::Key, value::Value};
 
 pub mod state {
     pub struct Frozen;
@@ -56,35 +56,6 @@ impl MemTable<state::Active> {
 
     pub fn should_freeze(&self) -> bool {
         self.size >= MEMTABLE_MAX_SIZE
-    }
-
-    pub fn recover_from(records: &[WalRecord]) -> MemTable<state::Active> {
-        let mut data = BTreeMap::<Key, Value>::new();
-
-        let mut size = 0;
-        for record in records {
-            match record {
-                WalRecord::Put { key, val } => {
-                    size += val.len();
-                    if let Some(Value::Data(data)) =
-                        data.insert(key.clone(), Value::Data(val.clone()))
-                    {
-                        size -= data.len();
-                    }
-                }
-                WalRecord::Delete { key } => {
-                    if let Some(Value::Data(data)) = data.insert(key.clone(), Value::Tombstone) {
-                        size -= data.len();
-                    }
-                }
-            }
-        }
-
-        MemTable {
-            data,
-            size,
-            phantom: std::marker::PhantomData,
-        }
     }
 
     pub fn freeze(&mut self) -> MemTable<state::Frozen> {
