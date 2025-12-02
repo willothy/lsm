@@ -11,7 +11,7 @@ use crate::{
     key::{Key, SeqNo},
     memtable::state::Frozen,
     sstable::{
-        manifest::{FileMeta, Manifest, ManifestRecord},
+        manifest::{FileMeta, LevelMeta, Manifest, ManifestRecord},
         sstable::{index_block_size, BlockMeta, SSTableFooter, BLOCK_SIZE},
         Level,
     },
@@ -192,6 +192,42 @@ impl SSTableManager {
         crate::framed::write_framed(&mut self.active_file, &record)
             .context("Failed to append record")?;
 
+        match record {
+            ManifestRecord::Snapshot(manifest) => {
+                self.active_manifest = manifest;
+            }
+            ManifestRecord::CreateFile { level, file_meta } => {
+                self.active_manifest
+                    .levels
+                    .entry(level)
+                    .or_insert_with(|| LevelMeta {
+                        level,
+                        files: Default::default(),
+                    })
+                    .files
+                    .insert(FileNo(file_meta.file_number), file_meta);
+            }
+            ManifestRecord::DeleteFile { level, file_number } => {
+                self.active_manifest
+                    .levels
+                    .entry(level)
+                    .or_insert_with(|| LevelMeta {
+                        level,
+                        files: Default::default(),
+                    })
+                    .files
+                    .remove(&FileNo(file_number));
+            }
+            ManifestRecord::SetLastSeqNo(seq_no) => {
+                self.active_manifest.last_committed_sequence_number =
+                    seq_no.max(self.active_manifest.last_committed_sequence_number);
+            }
+            ManifestRecord::AllocFileNumber(file_no) => {
+                self.active_manifest.next_file_number =
+                    self.active_manifest.next_file_number.max(file_no + 1);
+            }
+        }
+
         Ok(())
     }
 
@@ -225,6 +261,7 @@ impl SSTableManager {
         &mut self,
         file: &mut std::fs::File,
         file_no: FileNo,
+        sstable_size: u64,
         first_key: &Key,
         last_key: &Key,
         block_meta: &[BlockMeta],
@@ -250,6 +287,19 @@ impl SSTableManager {
             magic: 0xDEAD_BEEF,
         };
 
+        self.append_record(ManifestRecord::CreateFile {
+            level: Level(0),
+            file_meta: FileMeta {
+                file_number: file_no.0,
+                file_size: sstable_size
+                    + index_buf.len() as u64
+                    + std::mem::size_of::<SSTableFooter>() as u64,
+                smallest_key: first_key.encode_to_bytes(),
+                largest_key: last_key.encode_to_bytes(),
+            },
+        })?;
+        self.sync()?;
+
         index_buf.clear();
 
         footer.encode_into(&mut index_buf);
@@ -258,17 +308,6 @@ impl SSTableManager {
 
         file.flush()?;
         file.sync_all()?;
-
-        self.append_record(ManifestRecord::CreateFile {
-            level: Level(0),
-            file_meta: FileMeta {
-                file_number: file_no.0,
-                file_size: BASE_LEVEL_SIZE as u64,
-                smallest_key: first_key.encode_to_bytes(),
-                largest_key: last_key.encode_to_bytes(),
-            },
-        })?;
-        self.sync()?;
 
         Ok(())
     }
@@ -299,8 +338,6 @@ impl SSTableManager {
 
         file.seek(std::io::SeekFrom::Start(0))?;
 
-        let mut entry_buf = bytes::BytesMut::with_capacity(128);
-
         let mut first_key = None;
         let mut last_key = None;
 
@@ -308,13 +345,12 @@ impl SSTableManager {
 
         for (idx, (key, val)) in data.iter().enumerate() {
             first_key = Some(first_key.unwrap_or_else(|| key.clone()));
+            last_key = Some(key.clone());
 
-            entry_buf.clear();
+            key.encode_into(&mut current_block);
+            val.encode_into(&mut current_block);
 
-            key.encode_into(&mut entry_buf);
-            val.encode_into(&mut entry_buf);
-
-            if current_block.len() + entry_buf.len() >= BLOCK_SIZE {
+            if current_block.len() >= BLOCK_SIZE {
                 block_meta.push(BlockMeta {
                     last_key: last_key.clone().expect(
                         "There should be at least one key in the block if we're writing it",
@@ -325,29 +361,29 @@ impl SSTableManager {
 
                 file.write_all(&current_block)?;
 
-                current_block.clear();
+                sstable_size += current_block.len() as u64;
 
-                sstable_size += BLOCK_SIZE as u64;
+                current_block.clear();
             }
 
             if sstable_size
-                + BLOCK_SIZE as u64
                 + index_block_size(&block_meta) as u64
                 + std::mem::size_of::<SSTableFooter>() as u64
-                > (BASE_LEVEL_SIZE as u64)
+                >= (BASE_LEVEL_SIZE as u64)
             {
                 self.finalize_sstable(
                     &mut file,
                     file_no,
+                    sstable_size,
                     first_key.as_ref().expect("smallest key"),
                     last_key.as_ref().expect("largest key"),
                     &block_meta,
                 )?;
 
                 block_meta.clear();
-                current_block.clear();
                 sstable_size = 0;
                 first_key = None;
+                last_key = None;
 
                 // Don't allocate a new file if this is the last entry
                 if idx + 1 < data.len() {
@@ -361,10 +397,6 @@ impl SSTableManager {
                         .context("Failed to create new SSTable file")?;
                 }
             }
-
-            current_block.put_slice(&entry_buf);
-
-            last_key = Some(key.clone());
         }
 
         // If first_key is None, we finalized the SSTable on the last entry and skipped
@@ -383,6 +415,7 @@ impl SSTableManager {
             self.finalize_sstable(
                 &mut file,
                 file_no,
+                sstable_size,
                 smallest_key,
                 last_key.as_ref().expect("largest key"),
                 &block_meta,

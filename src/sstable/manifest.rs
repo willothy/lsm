@@ -12,7 +12,7 @@ pub struct Manifest {
     pub next_file_number: FileNo,
     pub last_committed_sequence_number: SeqNo,
 
-    levels: BTreeMap<Level, LevelMeta>,
+    pub levels: BTreeMap<Level, LevelMeta>,
 }
 
 impl Manifest {
