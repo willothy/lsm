@@ -1,18 +1,19 @@
 use std::{
+    collections::VecDeque,
     io::{Read, Seek, Write},
     sync::Arc,
 };
 
 use anyhow::Context;
 use bytes::BufMut;
-use parking_lot::{Mutex, RwLock};
-use seize::Guard;
 
 use crate::{
     config::Config,
-    db::FrozenTables,
     key::{Key, SeqNo},
-    memtable::{state::Frozen, MemTable},
+    memtable::{
+        state::{self, Frozen},
+        MemTable,
+    },
     sstable::{
         manifest::{FileMeta, LevelMeta, Manifest, ManifestRecord},
         sstable::{index_block_size, BlockMeta, SSTableFooter, BLOCK_SIZE},
@@ -63,17 +64,17 @@ pub struct SSTableManager {
     config: Arc<crate::config::Config>,
 
     /// Locked [`CURRENT_FILE_NAME`] file acts as a pointer to the active [`Manifest`].
-    current: Mutex<std::fs::File>,
+    current: std::fs::File,
 
-    active_file: Mutex<std::fs::File>,
+    active_file: std::fs::File,
 
-    active_manifest: RwLock<Manifest>,
+    active_manifest: Manifest,
 }
 
 impl Drop for SSTableManager {
     fn drop(&mut self) {
-        self.current.lock().unlock().ok();
-        self.active_file.lock().unlock().ok();
+        self.current.unlock().ok();
+        self.active_file.unlock().ok();
     }
 }
 
@@ -187,24 +188,23 @@ impl SSTableManager {
         Ok(SSTableManager {
             config,
 
-            current: Mutex::new(current_file),
+            current: current_file,
 
-            active_file: Mutex::new(active_file),
-            active_manifest: RwLock::new(active_manifest),
+            active_file,
+            active_manifest,
         })
     }
 
-    fn append_record(&self, record: ManifestRecord) -> anyhow::Result<()> {
-        crate::framed::write_framed(&mut *self.active_file.lock(), &record)
+    fn append_record(&mut self, record: ManifestRecord) -> anyhow::Result<()> {
+        crate::framed::write_framed(&mut self.active_file, &record)
             .context("Failed to append record")?;
 
         match record {
             ManifestRecord::Snapshot(manifest) => {
-                *self.active_manifest.write() = manifest;
+                self.active_manifest = manifest;
             }
             ManifestRecord::CreateFile { level, file_meta } => {
                 self.active_manifest
-                    .write()
                     .levels
                     .entry(level)
                     .or_insert_with(|| LevelMeta {
@@ -216,7 +216,6 @@ impl SSTableManager {
             }
             ManifestRecord::DeleteFile { level, file_number } => {
                 self.active_manifest
-                    .write()
                     .levels
                     .entry(level)
                     .or_insert_with(|| LevelMeta {
@@ -227,12 +226,12 @@ impl SSTableManager {
                     .remove(&FileNo(file_number));
             }
             ManifestRecord::SetLastSeqNo(seq_no) => {
-                let mut manifest = self.active_manifest.write();
+                let manifest = &mut self.active_manifest;
                 manifest.last_committed_sequence_number =
                     seq_no.max(manifest.last_committed_sequence_number);
             }
             ManifestRecord::AllocFileNumber(file_no) => {
-                let mut manifest = self.active_manifest.write();
+                let manifest = &mut self.active_manifest;
 
                 manifest.next_file_number = manifest.next_file_number.max(file_no + 1);
             }
@@ -241,22 +240,20 @@ impl SSTableManager {
         Ok(())
     }
 
-    fn sync(&self) -> anyhow::Result<()> {
+    fn sync(&mut self) -> anyhow::Result<()> {
         self.active_file
-            .lock()
             .flush()
             .context("Failed to flush active manifest file")?;
 
         self.active_file
-            .lock()
             .sync_all()
             .context("Failed to fsync active manifest file")?;
 
         Ok(())
     }
 
-    pub fn alloc_file_number(&self) -> anyhow::Result<FileNo> {
-        let (fileno, record) = self.active_manifest.write().alloc_file_number();
+    pub fn alloc_file_number(&mut self) -> anyhow::Result<FileNo> {
+        let (fileno, record) = self.active_manifest.alloc_file_number();
 
         self.append_record(record)?;
 
@@ -266,11 +263,11 @@ impl SSTableManager {
     }
 
     pub fn last_committed_sequence_number(&self) -> SeqNo {
-        self.active_manifest.read().last_committed_sequence_number
+        self.active_manifest.last_committed_sequence_number
     }
 
     fn finalize_sstable(
-        &self,
+        &mut self,
         file: &mut std::fs::File,
         file_no: FileNo,
         sstable_size: u64,
@@ -321,15 +318,15 @@ impl SSTableManager {
                 largest_key: last_key.encode_to_bytes(),
             },
         })?;
+
         self.sync()?;
 
         Ok(())
     }
 
-    fn flush_memtable_internal(
-        &self,
-        memtable: &crate::memtable::MemTable<Frozen>,
-        frozen: Arc<FrozenTables>,
+    async fn flush_memtable_internal(
+        &mut self,
+        frozen: &glommio::sync::RwLock<VecDeque<MemTable<Frozen>>>,
     ) -> anyhow::Result<()> {
         let mut file_no = self.alloc_file_number()?;
         let mut file = {
@@ -352,9 +349,28 @@ impl SSTableManager {
         let mut first_key = None;
         let mut last_key = None;
 
-        let data = memtable.data();
+        let memtable = {
+            let read_guard = frozen.read().await.expect("lock closed");
 
-        for (idx, (key, val)) in data.iter().enumerate() {
+            read_guard
+                .front()
+                .context("No frozen memtable available to flush")?
+                .clone()
+        };
+
+        const BUDGET: usize = 25;
+        let mut consumed = 0;
+
+        let memtable_data = memtable.data();
+
+        for (idx, (key, val)) in memtable_data.iter().enumerate() {
+            consumed += 1;
+
+            if consumed > BUDGET {
+                glommio::executor().yield_now().await;
+                consumed = 0;
+            }
+
             first_key = Some(first_key.unwrap_or_else(|| key.clone()));
             last_key = Some(key.clone());
 
@@ -396,7 +412,7 @@ impl SSTableManager {
                     last_key = None;
 
                     // Don't allocate a new file if this is the last entry
-                    if idx + 1 < data.len() {
+                    if idx + 1 < memtable_data.len() {
                         file_no = self.alloc_file_number()?;
                         let new_file_name = format_file_name(file_no, SSTABLE_FILE_EXT);
                         file = std::fs::OpenOptions::new()
@@ -435,29 +451,20 @@ impl SSTableManager {
             )?;
         }
 
-        frozen.mark_flushed();
-
         Ok(())
     }
 
-    pub fn flush_memtable(
-        &self,
-        memtable: &crate::memtable::MemTable<Frozen>,
-        frozen: Arc<FrozenTables>,
+    pub async fn flush_memtable(
+        &mut self,
+        frozen: &glommio::sync::RwLock<VecDeque<MemTable<Frozen>>>,
     ) -> anyhow::Result<()> {
-        if memtable.data().is_empty() {
-            return Ok(());
-        }
-
-        self.flush_memtable_internal(&memtable, frozen)?;
+        self.flush_memtable_internal(frozen).await?;
 
         Ok(())
     }
 
-    pub fn max_level(&self) -> Level {
-        let manifest = self.active_manifest.read();
-
-        manifest
+    pub async fn max_level(&self) -> Level {
+        self.active_manifest
             .levels
             .keys()
             .max()
@@ -466,9 +473,8 @@ impl SSTableManager {
     }
 
     pub fn iter_level(&self, level: Level) -> anyhow::Result<impl Iterator<Item = FileMeta> + '_> {
-        let manifest = self.active_manifest.read();
-
-        let level_meta = manifest
+        let level_meta = self
+            .active_manifest
             .levels
             .get(&level)
             .cloned()
@@ -477,6 +483,6 @@ impl SSTableManager {
                 files: Default::default(),
             });
 
-        Ok(level_meta.files.values().cloned())
+        Ok(level_meta.files.clone().into_values())
     }
 }

@@ -4,76 +4,15 @@ use std::{
 };
 
 use anyhow::Context;
-use arc_swap::ArcSwap;
 
 use crate::{
     config::Config,
     key::{Key, SeqNo},
     memtable::{state, MemTable},
-    sstable::{manager::SSTableManager, Level},
+    sstable::manager::{FileNo, SSTableManager},
     value::Value,
     wal::{Wal, WalRecord},
 };
-
-pub struct FrozenTables {
-    /// Frozen, immutable memtables waiting to be turned into SSTables.
-    pub(crate) tables: ArcSwap<VecDeque<MemTable<state::Frozen>>>,
-
-    flushed: AtomicUsize,
-}
-
-impl FrozenTables {
-    pub fn new(tables: VecDeque<MemTable<state::Frozen>>) -> Self {
-        Self {
-            tables: ArcSwap::from_pointee(tables),
-            flushed: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn compact(&self) {
-        self.tables.rcu(|list| {
-            let mut new_list = list.as_ref().clone();
-            let flushed = self.flushed.load(std::sync::atomic::Ordering::Relaxed);
-            for _ in 0..flushed {
-                new_list.pop_front();
-            }
-
-            // This will fail if list has changed since we loaded it, so we don't
-            // need to RCU to protect the flushed count.
-            self.flushed.store(0, std::sync::atomic::Ordering::Relaxed);
-
-            new_list
-        });
-    }
-
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = MemTable<state::Frozen>> {
-        self.tables
-            .load()
-            .as_ref()
-            .clone()
-            .into_iter()
-            .skip(self.flushed.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    pub fn push(&self, table: MemTable<state::Frozen>) {
-        self.tables.rcu(|list| {
-            let mut new_list = list.as_ref().clone();
-            new_list.push_back(table.clone());
-            new_list
-        });
-    }
-
-    pub fn pop_front(&self) -> Option<MemTable<state::Frozen>> {
-        let initial_flushed = self.flushed.load(std::sync::atomic::Ordering::Relaxed);
-
-        self.tables.load().get(initial_flushed).cloned()
-    }
-
-    pub fn mark_flushed(&self) {
-        self.flushed
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
 
 pub struct Database {
     config: Arc<Config>,
@@ -82,15 +21,17 @@ pub struct Database {
     table: MemTable<state::Active>,
 
     /// Frozen, immutable memtables waiting to be turned into SSTables.
-    imm_tables: Arc<FrozenTables>,
+    imm_tables: glommio::sync::RwLock<VecDeque<MemTable<state::Frozen>>>,
 
     wal: Wal,
 
     seqno: SeqNo,
 
-    sstables: Arc<SSTableManager>,
+    sstables: SSTableManager,
+}
 
-    flush_thread: std::thread::JoinHandle<()>,
+pub async fn coordinator_loop() {
+    loop {}
 }
 
 impl Database {
@@ -112,12 +53,12 @@ impl Database {
         let mut imm_tables = VecDeque::new();
 
         // TODO: CURRENT should point to the latest manifest file, not be a manifest itself.
-        let manager = SSTableManager::open(Arc::clone(&config))?;
+        let sstables = SSTableManager::open(Arc::clone(&config))?;
 
-        let mut max_seqno = manager.last_committed_sequence_number();
+        let mut max_seqno = sstables.last_committed_sequence_number();
 
         for record in replay {
-            if record.key().seqno() < manager.last_committed_sequence_number() {
+            if record.key().seqno() < sstables.last_committed_sequence_number() {
                 continue;
             }
 
@@ -139,41 +80,16 @@ impl Database {
             }
         }
 
-        let imm_tables = {
-            Arc::new(FrozenTables {
-                tables: ArcSwap::from_pointee(imm_tables),
-                flushed: AtomicUsize::new(0),
-            })
-        };
-
-        let sstables = Arc::new(manager);
-
-        let flush_thread = std::thread::spawn({
-            let sstables = Arc::clone(&sstables);
-            let imm_tables = Arc::clone(&imm_tables);
-            move || loop {
-                if let Some(frozen) = imm_tables.pop_front() {
-                    if let Err(e) = sstables.flush_memtable(&frozen, Arc::clone(&imm_tables)) {
-                        eprintln!("Error flushing memtable to SSTable: {:?}", e);
-                    }
-                } else {
-                    std::thread::park();
-                }
-            }
-        });
-
         // TODO: truncate WAL to remove processed entries (seqno <= last_committed_sequence_number)
 
         Ok(Self {
             config,
 
             table,
-            imm_tables,
+            imm_tables: glommio::sync::RwLock::new(imm_tables),
             wal,
             seqno: max_seqno.max(sstables.last_committed_sequence_number()) + 1,
             sstables,
-
-            flush_thread,
         })
     }
 
@@ -181,7 +97,7 @@ impl Database {
         self.table.should_freeze() || self.wal.should_compact()
     }
 
-    pub fn get(&self, key: &bytes::Bytes) -> Option<bytes::Bytes> {
+    pub async fn get(&self, key: &bytes::Bytes) -> Option<bytes::Bytes> {
         if let Some(value) = self.table.get_latest(key) {
             match value {
                 Value::Data(bytes) => return Some(bytes.clone()),
@@ -189,7 +105,14 @@ impl Database {
             }
         }
 
-        for table in self.imm_tables.iter().rev() {
+        for table in self
+            .imm_tables
+            .read()
+            .await
+            .expect("lock closed")
+            .iter()
+            .rev()
+        {
             if let Some(value) = table.get_latest(key) {
                 match value {
                     Value::Data(bytes) => return Some(bytes.clone()),
@@ -209,7 +132,7 @@ impl Database {
         None
     }
 
-    pub fn put(
+    pub async fn put(
         &mut self,
         key: impl Into<bytes::Bytes>,
         val: impl Into<bytes::Bytes>,
@@ -225,12 +148,12 @@ impl Database {
 
         self.table.put(key, val);
 
-        self.maybe_rotate_memtable();
+        self.maybe_rotate_memtable().await;
 
         Ok(())
     }
 
-    pub fn delete(&mut self, key: impl Into<bytes::Bytes>) -> anyhow::Result<()> {
+    pub async fn delete(&mut self, key: impl Into<bytes::Bytes>) -> anyhow::Result<()> {
         let key = key.into();
         let key = Key::new(key, self.seqno.next());
 
@@ -238,19 +161,22 @@ impl Database {
 
         self.table.delete(key);
 
-        self.maybe_rotate_memtable();
+        self.maybe_rotate_memtable().await;
 
         Ok(())
     }
 
-    fn maybe_rotate_memtable(&mut self) {
+    async fn maybe_rotate_memtable(&mut self) {
         if self.should_freeze_memtable() {
             let frozen = self.table.freeze();
 
-            self.imm_tables.push(frozen);
+            self.imm_tables
+                .write()
+                .await
+                .expect("lock closed")
+                .push_back(frozen);
 
-            // Tell the flush thread to wake up and flush the new frozen memtable.
-            self.flush_thread.thread().unpark();
+            // self.sstables.flush_memtable(frozen)
 
             // TODO: Handle WAL spanning multiple memtables so we can be crash-safe and
             // not lose the frozen memtables.
